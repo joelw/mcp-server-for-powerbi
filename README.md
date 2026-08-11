@@ -6,7 +6,7 @@
 
 Model Context Protocol (MCP) server for exploring Microsoft Fabric / Power BI workspaces and semantic models, and for executing ad‑hoc DAX queries.
 
-**🔐 Now with OAuth/Entra ID support!** Seamlessly integrates with LibreChat and other OAuth-enabled clients using JWT validation and On-Behalf-Of flow.
+**🔐 Now with OAuth/Entra ID support!** Seamlessly integrates with LibreChat and other OAuth-enabled clients using JWT validation.
 
 ## Architecture Overview
 
@@ -26,9 +26,9 @@ Model Context Protocol (MCP) server for exploring Microsoft Fabric / Power BI wo
 ### 🌐 HTTP Transport with OAuth (Recommended for Production)
 - Full Entra ID/Azure AD authentication
 - JWT token validation with JWKS
-- On-Behalf-Of (OBO) flow for Power BI and Fabric API access
+- Callers authenticate directly against the Power BI API; their token is validated and used as-is
 - Role and scope-based authorization
-- Claims challenge support for conditional access
+- Conditional access is satisfied at interactive sign-in, not by a server-side token exchange
 - **Perfect for LibreChat integration**
 
 ### 💻 STDIO Transport (Local Development)
@@ -77,13 +77,11 @@ uv sync
 # Azure AD Configuration
 PORT=3001
 TENANT_ID=your-tenant-id
-AUDIENCE=your-api-app-id
-OBO_CLIENT_ID=your-obo-client-id
-OBO_CLIENT_SECRET=your-obo-client-secret
+AUDIENCE=https://analysis.windows.net/powerbi/api,00000009-0000-0000-c000-000000000000
 
-# Authorization
-REQUIRED_SCOPES=mcp.access
-REQUIRED_ROLES=mcp.user
+# Authorization (optional; these are Power BI delegated scopes)
+REQUIRED_SCOPES=
+REQUIRED_ROLES=
 
 # Logging
 LOG_LEVEL=info
@@ -111,8 +109,15 @@ uv run mcp-for-powerbi
 
 Both HTTP and STDIO modes now use Entra ID OAuth2 with:
 - **JWT Validation**: Verifies token signature, audience, issuer
-- **OBO Flow**: Exchanges user token for downstream Power BI and Fabric tokens (resource-bound)
+- **Direct token**: The client obtains a Power BI access token from Entra ID and
+  sends it as the bearer token; the server validates it and calls Power BI with
+  it unchanged. There is no server-side token exchange, so conditional access is
+  evaluated once, interactively, when the user signs in.
 - **Authorization**: Validates roles and scopes
+
+Entra ID issues v1.0 tokens for the Power BI API (`iss` of
+`https://sts.windows.net/<tenant-id>/`), so both the v1.0 and v2.0 issuer forms
+are accepted.
 
 ## Client Integration Examples
 
@@ -129,7 +134,7 @@ mcpServers:
       token_url: https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
       client_id: <client-id>
       client_secret: <client-secret>
-      scope: "api://<api-app-id>/mcp.access openid profile offline_access"
+      scope: "https://analysis.windows.net/powerbi/api/.default"
       redirect_uri: http://localhost:3080/api/mcp/mcp-server-for-powerbi/oauth/callback
 ```
 
@@ -176,9 +181,7 @@ docker build -t <acr-name>.azurecr.io/mcp-server-for-powerbi .
 ```bash
 docker run -it --rm -p 8080:8080 \
   -e TENANT_ID=<tenant-id> \
-  -e AUDIENCE=<api-app-id> \
-  -e OBO_CLIENT_ID=<obo-client-id> \
-  -e OBO_CLIENT_SECRET=<obo-secret> \
+  -e AUDIENCE=https://analysis.windows.net/powerbi/api,00000009-0000-0000-c000-000000000000 \
   <acr-name>.azurecr.io/mcp-server-for-powerbi
 ```
 
