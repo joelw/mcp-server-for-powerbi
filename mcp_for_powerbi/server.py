@@ -37,12 +37,26 @@ class PowerBIAPIError(ToolError):
     """A ToolError that also carries the HTTP status of the failed Power BI call.
 
     Callers that need to react to *how* a call failed (rather than just report
-    it) can read status_code instead of pattern-matching the message text.
+    it) can read status_code and error_code instead of pattern-matching the
+    message text.
     """
 
-    def __init__(self, message: str, status_code: int):
+    def __init__(self, message: str, status_code: int, error_code: str = "Unknown"):
         super().__init__(message)
         self.status_code = status_code
+        self.error_code = error_code
+
+    def is_token_rejection(self) -> bool:
+        """True when Power BI rejected the caller's token itself.
+
+        A 401 always means the token was not accepted. A 403 normally means the
+        opposite - the token was accepted, but the caller has no access to the
+        resource - which re-authenticating will not fix. The exception is
+        TokenExpired, which Power BI reports as a 403.
+        """
+        if self.status_code == 401:
+            return True
+        return self.status_code == 403 and "TokenExpired" in self.error_code
 
 
 class PowerBIClient:
@@ -81,16 +95,22 @@ class PowerBIClient:
         """Build auth headers for Power BI API calls."""
         return self.headers
 
+    @staticmethod
+    def _extract_error_code(error_data: Any) -> str:
+        """Pull Power BI's own error code out of a response body."""
+        if isinstance(error_data, dict):
+            return error_data.get("error", {}).get("code", "Unknown")
+        return "Unknown"
+
     def _build_error_message(self, status_code: int, error_data: Any, path: str) -> str:
         """Build a detailed error message with helpful suggestions."""
         suggestions = []
 
         # Extract error details
+        error_code = self._extract_error_code(error_data)
         if isinstance(error_data, dict):
-            error_code = error_data.get("error", {}).get("code", "Unknown")
             error_message = error_data.get("error", {}).get("message", str(error_data))
         else:
-            error_code = "Unknown"
             error_message = str(error_data)
 
         # Build context-aware suggestions based on status code and path
@@ -181,7 +201,7 @@ class PowerBIClient:
                 error_data = r.text
 
             error_message = self._build_error_message(r.status_code, error_data, path)
-            raise PowerBIAPIError(error_message, r.status_code)
+            raise PowerBIAPIError(error_message, r.status_code, self._extract_error_code(error_data))
 
         # Parse successful response; some endpoints return 202/204 with no body
         if r.status_code == 204 or not r.content:
@@ -381,18 +401,21 @@ def powerbi_list_workspaces(ctx: Context) -> Dict[str, Any]:
     try:
         client = PowerBIClient()
         return client.request("GET", "/groups")
-    except ToolError as e:
-        # Re-raise with additional context for workspace listing
-        error_msg = str(e)
-        if "401" in error_msg or "Unauthorized" in error_msg:
-            raise ToolError(
-                f"{error_msg}\n\n"
-                f"Additional context for listing workspaces:\n"
-                f"  - This operation requires a valid Power BI access token\n"
-                f"  - The token must have 'Workspace.Read.All' or 'Workspace.ReadWrite.All' scope\n"
-                f"  - Ensure the Authorization header contains a valid OAuth token"
-            )
-        raise
+    except PowerBIAPIError as e:
+        # Add context for workspace listing, but keep the error's type and
+        # status: the transport layer needs them to tell a rejected token
+        # apart from an ordinary failure.
+        if e.status_code != 401:
+            raise
+        raise PowerBIAPIError(
+            f"{e}\n\n"
+            f"Additional context for listing workspaces:\n"
+            f"  - This operation requires a valid Power BI access token\n"
+            f"  - The token must have 'Workspace.Read.All' or 'Workspace.ReadWrite.All' scope\n"
+            f"  - Ensure the Authorization header contains a valid OAuth token",
+            e.status_code,
+            e.error_code,
+        )
 
 
 @mcp.tool
