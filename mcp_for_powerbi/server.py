@@ -33,30 +33,70 @@ def reset_request_scoped_powerbi_client_factory(
     _request_scoped_client_factory.reset(token)
 
 
+# Values Power BI puts in x-powerbi-error-info when the problem is the token
+# itself, rather than what the token's owner is allowed to see.
+_TOKEN_REJECTION_ERROR_INFO = frozenset({"InvalidToken", "TokenExpired", "ExpiredToken"})
+
+
 class PowerBIAPIError(ToolError):
     """A ToolError that also carries the HTTP status of the failed Power BI call.
 
     Callers that need to react to *how* a call failed (rather than just report
-    it) can read status_code and error_code instead of pattern-matching the
-    message text.
+    it) can read status_code, error_code and error_info instead of
+    pattern-matching the message text.
     """
 
-    def __init__(self, message: str, status_code: int, error_code: str = "Unknown"):
+    def __init__(
+        self,
+        message: str,
+        status_code: int,
+        error_code: str = "Unknown",
+        error_info: str | None = None,
+        www_authenticate: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.error_code = error_code
+        # Power BI names the failure in the x-powerbi-error-info response
+        # header. It is the only signal present when the body is empty, which
+        # is the case for every auth-related failure.
+        self.error_info = error_info
+        self.www_authenticate = www_authenticate
 
     def is_token_rejection(self) -> bool:
         """True when Power BI rejected the caller's token itself.
 
-        A 401 always means the token was not accepted. A 403 normally means the
-        opposite - the token was accepted, but the caller has no access to the
-        resource - which re-authenticating will not fix. The exception is
-        TokenExpired, which Power BI reports as a 403.
+        Power BI answers 403 - not 401 - when the token is the problem, and
+        names the reason in x-powerbi-error-info. A 401 means the opposite: the
+        token was accepted and the caller simply cannot see the workspace,
+        which re-authenticating will not fix.
+
+        Observed against the live API (POST .../executeQueries):
+
+            no Authorization header      403, no error-info header
+            malformed token              403  InvalidToken
+            well-formed but invalid JWT  403  TokenExpired
+            valid token, no workspace    401  GroupNotAccessible
+            valid token, no Build perm   404, no error-info header
+
+        The header is authoritative when present. The status is only a
+        fallback, because the body is empty in all of these cases and so
+        error_code is "Unknown".
         """
-        if self.status_code == 401:
+        if self.error_info:
+            return self.error_info in _TOKEN_REJECTION_ERROR_INFO
+
+        # A conditional access challenge is a re-auth the client can act on,
+        # whatever status carries it.
+        if self.www_authenticate and "insufficient_claims" in self.www_authenticate:
             return True
-        return self.status_code == 403 and "TokenExpired" in self.error_code
+
+        if any(marker in self.error_code for marker in _TOKEN_REJECTION_ERROR_INFO):
+            return True
+
+        # 403 with nothing else to go on means the request was not
+        # authenticated at all (e.g. no Authorization header).
+        return self.status_code == 403
 
 
 class PowerBIClient:
@@ -102,7 +142,7 @@ class PowerBIClient:
             return error_data.get("error", {}).get("code", "Unknown")
         return "Unknown"
 
-    def _build_error_message(self, status_code: int, error_data: Any, path: str) -> str:
+    def _build_error_message(self, status_code: int, error_data: Any, path: str, error_info: str | None = None) -> str:
         """Build a detailed error message with helpful suggestions."""
         suggestions = []
 
@@ -113,25 +153,40 @@ class PowerBIClient:
         else:
             error_message = str(error_data)
 
+        # Power BI returns an empty body for every auth-related failure, so the
+        # header is all there is to report.
+        if not error_message.strip():
+            error_message = f"{error_info} (no response body)" if error_info else "(no response body)"
+
         # Build context-aware suggestions based on status code and path
+        # Power BI uses 401 for "your token is fine, but you cannot see this
+        # workspace" and 403 for "your token is the problem" - the opposite way
+        # round to most APIs. Advice that follows the usual convention sends
+        # the caller looking in the wrong place.
         if status_code == 401:
             suggestions.extend(
                 [
-                    "Verify the Power BI access token is valid and not expired",
-                    "Check if the required permission scope is present in the token",
-                    "Ensure the token has the necessary API permissions (Dataset.ReadWrite.All or Dataset.Read.All)",
+                    "Your token was accepted - this is an access problem, not an authentication one, "
+                    "so obtaining a new token will not help",
+                    "Verify you have access to the requested workspace",
+                    "Check if you are a member, contributor or admin of the workspace",
                 ]
             )
+            if error_info == "GroupNotAccessible":
+                suggestions.append(
+                    "Power BI reported GroupNotAccessible: the workspace either does not exist "
+                    "or is not shared with you"
+                )
         elif status_code == 403:
-            if "TokenExpired" in error_code:
-                suggestions.append("The access token has expired - please obtain a new token")
+            if error_info in _TOKEN_REJECTION_ERROR_INFO or "TokenExpired" in error_code:
+                suggestions.append("The access token was rejected - please obtain a new token")
             else:
                 suggestions.extend(
                     [
-                        "Verify you have access to the requested workspace",
-                        "Check if you are a member or admin of the workspace",
-                        "Ensure you have the required permissions for this operation",
-                        "The authorization header might be incorrect - check for typos",
+                        "The access token was missing or rejected - please obtain a new token",
+                        "Check the Authorization header is present and formatted as 'Bearer <token>'",
+                        "Ensure the token has the necessary API permissions "
+                        "(Dataset.ReadWrite.All or Dataset.Read.All)",
                     ]
                 )
         elif status_code == 404:
@@ -200,8 +255,15 @@ class PowerBIClient:
             except ValueError:
                 error_data = r.text
 
-            error_message = self._build_error_message(r.status_code, error_data, path)
-            raise PowerBIAPIError(error_message, r.status_code, self._extract_error_code(error_data))
+            error_info = r.headers.get("x-powerbi-error-info")
+            error_message = self._build_error_message(r.status_code, error_data, path, error_info)
+            raise PowerBIAPIError(
+                error_message,
+                r.status_code,
+                self._extract_error_code(error_data),
+                error_info,
+                r.headers.get("WWW-Authenticate"),
+            )
 
         # Parse successful response; some endpoints return 202/204 with no body
         if r.status_code == 204 or not r.content:
@@ -402,10 +464,11 @@ def powerbi_list_workspaces(ctx: Context) -> Dict[str, Any]:
         client = PowerBIClient()
         return client.request("GET", "/groups")
     except PowerBIAPIError as e:
-        # Add context for workspace listing, but keep the error's type and
-        # status: the transport layer needs them to tell a rejected token
-        # apart from an ordinary failure.
-        if e.status_code != 401:
+        # Add context for workspace listing, but keep the error's type, status
+        # and headers: the transport layer needs them to tell a rejected token
+        # apart from an ordinary failure. Dropping error_info here would make
+        # is_token_rejection fall back to guessing from the status alone.
+        if not e.is_token_rejection():
             raise
         raise PowerBIAPIError(
             f"{e}\n\n"
@@ -415,6 +478,8 @@ def powerbi_list_workspaces(ctx: Context) -> Dict[str, Any]:
             f"  - Ensure the Authorization header contains a valid OAuth token",
             e.status_code,
             e.error_code,
+            e.error_info,
+            e.www_authenticate,
         )
 
 
