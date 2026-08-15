@@ -6,6 +6,7 @@ Uses modern streamable-http transport with Entra ID authentication for Azure/Lib
 import os
 import sys
 import logging
+from typing import Any
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.requests import Request
@@ -18,6 +19,7 @@ import json
 # Import all tools and configurations from the main server
 from .server import (
     mcp,
+    PowerBIAPIError,
     PowerBIClient,
     set_request_scoped_powerbi_client_factory,
     reset_request_scoped_powerbi_client_factory,
@@ -81,6 +83,55 @@ def _log_tool_error(tool_name: str, tool_error: Exception) -> None:
     logger.info("Tool %s returned an error: %s", tool_name, summary)
     if separator:
         logger.debug("Tool %s error detail:\n%s", tool_name, message)
+
+
+# ── Error responses ────────────────────────────────────────────────────────
+def _header_safe(value: str, limit: int = 200) -> str:
+    """Collapse a message into something that can sit in a quoted header param."""
+    collapsed = " ".join(value.split())
+    collapsed = collapsed.replace("\\", " ").replace('"', "'")
+    if len(collapsed) > limit:
+        collapsed = collapsed[: limit - 1].rstrip() + "…"
+    return collapsed
+
+
+def _tool_error_response(request_id: Any, message: str) -> JSONResponse:
+    """Report a tool failure as an MCP result the calling model can read."""
+    return JSONResponse(
+        content={
+            "jsonrpc": "2.0",
+            "result": {"content": [{"type": "text", "text": message}], "isError": True},
+            "id": request_id,
+        }
+    )
+
+
+def _unauthenticated_response(request_id: Any, exc: PowerBIAPIError) -> JSONResponse:
+    """Report that Power BI rejected the caller's token, so the client re-authenticates.
+
+    The caller holds the Power BI token directly, so only the client can fix
+    this. Returning it as a tool result would leave the model apologising for a
+    failure it cannot act on, while the client sat on a token it did not know
+    was dead.
+    """
+    description = _header_safe(f"Power BI rejected the access token ({exc.error_code}).")
+    return JSONResponse(
+        status_code=401,
+        headers={"WWW-Authenticate": f'Bearer error="invalid_token", error_description="{description}"'},
+        content={
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32001,
+                "message": "unauthenticated: Power BI rejected the access token.",
+                "data": {
+                    "powerBiStatus": exc.status_code,
+                    "powerBiCode": exc.error_code,
+                    "detail": str(exc),
+                },
+            },
+            "id": request_id,
+        },
+    )
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -224,6 +275,22 @@ async def mcp_handler(request: Request):
                     }
                 )
 
+            except PowerBIAPIError as tool_error:
+                # Power BI rejecting the token is the client's problem to fix,
+                # not the model's. Everything else it reports is a normal tool
+                # failure.
+                if tool_error.is_token_rejection():
+                    logger.warning(
+                        "Power BI rejected the token on %s (%s %s)",
+                        tool_name,
+                        tool_error.status_code,
+                        tool_error.error_code,
+                    )
+                    return _unauthenticated_response(request_id, tool_error)
+
+                _log_tool_error(tool_name, tool_error)
+                return _tool_error_response(request_id, str(tool_error))
+
             except ToolError as tool_error:
                 # Expected, caller-correctable failure: bad DAX, unknown dataset,
                 # insufficient permissions. Report it as a tool result with
@@ -231,16 +298,7 @@ async def mcp_handler(request: Request):
                 # its query, rather than as a server fault the client can only
                 # treat as a transport failure.
                 _log_tool_error(tool_name, tool_error)
-                return JSONResponse(
-                    content={
-                        "jsonrpc": "2.0",
-                        "result": {
-                            "content": [{"type": "text", "text": str(tool_error)}],
-                            "isError": True,
-                        },
-                        "id": request_id,
-                    }
-                )
+                return _tool_error_response(request_id, str(tool_error))
 
             except Exception as tool_error:
                 # Genuinely unexpected - keep the traceback and the 500.
