@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, List
 
 import jwt
 from jwt import PyJWKClient
+from jwt.exceptions import PyJWKClientError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -36,7 +37,8 @@ class EntraIDPayload:
         self.idp: Optional[str] = payload.get("idp")
         self.name: Optional[str] = payload.get("name")
         self.oid: Optional[str] = payload.get("oid")
-        self.preferred_username: Optional[str] = payload.get("preferred_username")
+        # v1.0 tokens (e.g. from the Power BI API) carry upn instead.
+        self.preferred_username: Optional[str] = payload.get("preferred_username") or payload.get("upn")
         self.rh: Optional[str] = payload.get("rh")
         self.roles: Optional[List[str]] = payload.get("roles", [])
         self.scp: Optional[str] = payload.get("scp")
@@ -62,7 +64,7 @@ class EntraIDPayload:
 
 class EntraIDAuthMiddleware(BaseHTTPMiddleware):
     """
-    Middleware to validate Entra ID (Azure AD) v2.0 access tokens
+    Middleware to validate Entra ID (Azure AD) access tokens
     """
 
     def __init__(
@@ -81,9 +83,19 @@ class EntraIDAuthMiddleware(BaseHTTPMiddleware):
         self.required_roles = required_roles or []
         self.log_level = log_level.lower()
 
-        # JWKS URI for Entra ID v2.0
+        # Both token versions are accepted. First-party resources such as the
+        # Power BI API do not set accessTokenAcceptedVersion, so they are issued
+        # v1.0 tokens (sts.windows.net) even from the v2.0 endpoint.
+        self.issuers = [
+            f"https://login.microsoftonline.com/{tenant_id}/v2.0",
+            f"https://sts.windows.net/{tenant_id}/",
+        ]
+
+        # The v2.0 and v1.0 discovery documents publish the same signing keys,
+        # but fall back to the v1.0 set if a token is signed with a key that is
+        # only listed there.
         self.jwks_uri = f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
-        self.issuer = f"https://login.microsoftonline.com/{tenant_id}/v2.0"
+        self.jwks_uri_fallback = f"https://login.microsoftonline.com/{tenant_id}/discovery/keys"
 
         # PyJWKClient with caching
         self.jwks_client = PyJWKClient(
@@ -93,8 +105,23 @@ class EntraIDAuthMiddleware(BaseHTTPMiddleware):
             cache_jwk_set=True,
             lifespan=360,  # 6 hours
         )
+        self.jwks_client_fallback = PyJWKClient(
+            self.jwks_uri_fallback,
+            cache_keys=True,
+            max_cached_keys=10,
+            cache_jwk_set=True,
+            lifespan=360,
+        )
 
         logger.info(f"EntraIDAuthMiddleware initialized: tenant={tenant_id}, audience={', '.join(self.audiences)}")
+
+    def _get_signing_key(self, token: str):
+        """Resolve the token's signing key, falling back to the v1.0 key set."""
+        try:
+            return self.jwks_client.get_signing_key_from_jwt(token)
+        except PyJWKClientError:
+            self._log("debug", "auth.jwks.fallback_to_v1_keys")
+            return self.jwks_client_fallback.get_signing_key_from_jwt(token)
 
     @staticmethod
     def _parse_audiences(audience: str) -> List[str]:
@@ -164,31 +191,34 @@ class EntraIDAuthMiddleware(BaseHTTPMiddleware):
                 "preferred_username": unverified_claims.get("preferred_username"),
                 "name": unverified_claims.get("name"),
                 "exp": unverified_claims.get("exp"),
-                "expected": {"issuer": self.issuer, "audience": self.audiences},
+                "expected": {"issuers": self.issuers, "audience": self.audiences},
             }
             self._log("debug", "auth.token.debug", safe_payload)
 
         # Verify and decode token
         try:
             # Get signing key from JWKS
-            signing_key = self.jwks_client.get_signing_key_from_jwt(token)
+            signing_key = self._get_signing_key(token)
 
-            # Decode and verify token
+            # Decode and verify token. The issuer is checked below against both
+            # accepted forms, which jwt.decode cannot express directly.
             payload = jwt.decode(
                 token,
                 signing_key.key,
                 algorithms=["RS256"],
                 audience=self.audiences,
-                issuer=self.issuer,
                 options={
                     "verify_signature": True,
                     "verify_exp": True,
                     "verify_nbf": True,
                     "verify_iat": True,
                     "verify_aud": True,
-                    "verify_iss": True,
+                    "verify_iss": False,
                 },
             )
+
+            if payload.get("iss") not in self.issuers:
+                raise jwt.InvalidIssuerError(f"Invalid issuer: {payload.get('iss')}")
 
             # Create EntraIDPayload object
             entra_payload = EntraIDPayload(payload)
@@ -262,11 +292,14 @@ class EntraIDAuthMiddleware(BaseHTTPMiddleware):
             self._log(
                 "warning",
                 f"auth.token.invalid_issuer: {e}",
-                {"expected_issuer": self.issuer, "current_token_iss": current_token_iss},
+                {"expected_issuers": self.issuers, "current_token_iss": current_token_iss},
             )
             return JSONResponse(
                 status_code=401,
-                content={"error": "invalid_issuer", "message": f"Token issuer mismatch. Expected: {self.issuer}"},
+                content={
+                    "error": "invalid_issuer",
+                    "message": f"Token issuer mismatch. Expected one of: {', '.join(self.issuers)}",
+                },
             )
         except jwt.InvalidTokenError as e:
             self._log("warning", f"auth.token.invalid: {e}")

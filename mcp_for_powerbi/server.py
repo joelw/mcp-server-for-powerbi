@@ -6,7 +6,6 @@ from contextvars import ContextVar, Token
 from typing import Any, Callable, Dict, NamedTuple, Tuple
 from fastmcp import FastMCP, Context
 from fastmcp.exceptions import ToolError
-from .obo_flow import ClaimsChallengeError
 from fastmcp.server.dependencies import get_http_headers
 
 BASE_URL = "https://api.powerbi.com/v1.0/myorg"
@@ -65,17 +64,12 @@ class PowerBIAPIError(ToolError):
 
 
 class PowerBIClient:
-    def __init__(
-        self,
-        token: str | None = None,
-        token_provider: Callable[[], str] | None = None,
-    ):
-        if token is None and token_provider is None:
+    def __init__(self, token: str | None = None):
+        if token is None:
             request_factory = _request_scoped_client_factory.get()
             if request_factory:
                 scoped_client = request_factory()
                 self.token = scoped_client.token
-                self._token_provider = getattr(scoped_client, "_token_provider", None)
                 self.headers = scoped_client.headers
                 return
 
@@ -99,25 +93,10 @@ class PowerBIClient:
                 "Missing Power BI access token. Please provide it via Authorization header: 'Bearer <token>'"
             )
         self.token = token
-        self._token_provider = token_provider
         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     def _get_auth_headers(self) -> Dict[str, str]:
         """Build auth headers for Power BI API calls."""
-        if self._token_provider:
-            try:
-                access_token = self._token_provider()
-            except ToolError:
-                raise
-            except ClaimsChallengeError as exc:
-                raise ToolError(
-                    f"Claims challenge required for Power BI token. WWW-Authenticate: {exc.info.www_authenticate}"
-                )
-            except Exception as exc:
-                raise ToolError(f"Failed to get Power BI access token: {str(exc)}")
-            if not access_token:
-                raise ToolError("Missing Power BI access token")
-            return {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         return self.headers
 
     def _build_error_message(self, status_code: int, error_data: Any, path: str) -> str:

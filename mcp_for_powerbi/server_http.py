@@ -25,7 +25,6 @@ from .server import (
 
 # Import authentication
 from .auth_middleware import EntraIDAuthMiddleware, get_authenticated_user, get_bearer_token
-from .obo_flow import ClaimsChallengeError, get_obo_token_cached
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import FunctionTool
 
@@ -37,11 +36,6 @@ logger = logging.getLogger(__name__)
 PORT = int(os.getenv("PORT", "3001"))
 TENANT_ID = os.getenv("TENANT_ID")
 AUDIENCE = os.getenv("AUDIENCE")
-OBO_CLIENT_ID = os.getenv("OBO_CLIENT_ID") or os.getenv("CLIENT_ID")
-OBO_CLIENT_SECRET = os.getenv("OBO_CLIENT_SECRET") or os.getenv("CLIENT_SECRET")
-HAS_OBO_CREDENTIALS = bool(OBO_CLIENT_ID and OBO_CLIENT_SECRET)
-
-POWER_BI_DEFAULT_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
 
 # Ensure required configuration
 if not TENANT_ID or not AUDIENCE:
@@ -59,42 +53,19 @@ if LOG_LEVEL == "debug":
 
 # ── Client Factory ─────────────────────────────────────────────────────────
 def create_powerbi_client(request: Request) -> PowerBIClient:
-    """Create PowerBI client from request context with an OBO-exchanged Power BI token."""
+    """
+    Create a PowerBI client from the caller's own Power BI token.
+
+    The caller authenticates directly against Entra ID for the Power BI API, so
+    the validated bearer token is already addressed to Power BI and is used
+    as-is. Conditional access is therefore evaluated once, interactively, at
+    sign-in rather than on a server-side token exchange the user cannot answer.
+    """
     user_token = get_bearer_token(request)
     if not user_token:
         raise ToolError("Missing user authentication token")
 
-    tenant_id = TENANT_ID
-    if not tenant_id:
-        raise ToolError("TENANT_ID is not configured")
-
-    def token_provider() -> str:
-        requested_scopes = [POWER_BI_DEFAULT_SCOPE]
-
-        # Backward-compatible fallback: if OBO credentials aren't configured,
-        # pass through the caller token as-is.
-        client_id = OBO_CLIENT_ID
-        client_secret = OBO_CLIENT_SECRET
-        if not client_id or not client_secret:
-            logger.debug("OBO credentials unavailable; reusing incoming token for Power BI.")
-            return user_token
-
-        try:
-            return get_obo_token_cached(
-                tenant_id=tenant_id,
-                client_id=client_id,
-                client_secret=client_secret,
-                assertion=user_token,
-                scopes=requested_scopes,
-            )
-        except ClaimsChallengeError:
-            raise
-        except Exception as exc:
-            raise ToolError(
-                f"Failed to acquire Power BI token via OBO. Requested scope: {requested_scopes[0]}. Details: {str(exc)}"
-            )
-
-    return PowerBIClient(token=user_token, token_provider=token_provider)
+    return PowerBIClient(token=user_token)
 
 
 def _log_tool_error(tool_name: str, tool_error: Exception) -> None:
@@ -126,7 +97,7 @@ async def revoke_handler(request: Request):
 
 
 async def mcp_handler(request: Request):
-    """MCP endpoint with authentication and OBO flow"""
+    """MCP endpoint with Entra ID authentication"""
 
     # Get authenticated user
     user = get_authenticated_user(request)
@@ -237,30 +208,6 @@ async def mcp_handler(request: Request):
                 else:
                     raise ToolError(f"Tool {tool_name} is not callable")
 
-                # Check for claims challenge
-                claims_challenge = getattr(request.state, "claims_challenge_holder", {}).get("challenge")
-                if claims_challenge:
-                    return JSONResponse(
-                        status_code=401,
-                        headers={"WWW-Authenticate": claims_challenge.www_authenticate},
-                        content={
-                            "jsonrpc": "2.0",
-                            "error": {
-                                "code": -32001,
-                                "message": "claims_challenge: Conditional access challenge required.",
-                                "data": {
-                                    "claims": claims_challenge.claims,
-                                    "decodedClaims": claims_challenge.decoded_claims,
-                                    "error": claims_challenge.error,
-                                    "errorDescription": claims_challenge.error_description,
-                                    "traceId": claims_challenge.trace_id,
-                                    "correlationId": claims_challenge.correlation_id,
-                                },
-                            },
-                            "id": request_id,
-                        },
-                    )
-
                 # Return tool result
                 return JSONResponse(
                     content={
@@ -318,33 +265,6 @@ async def mcp_handler(request: Request):
                 },
             )
 
-    except ClaimsChallengeError as e:
-        logger.warning(f"Claims challenge: {e.info.error_description}")
-        try:
-            req_id = body.get("id") if "body" in locals() else None
-        except Exception:
-            req_id = None
-
-        return JSONResponse(
-            status_code=401,
-            headers={"WWW-Authenticate": e.info.www_authenticate},
-            content={
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32001,
-                    "message": "claims_challenge",
-                    "data": {
-                        "claims": e.info.claims,
-                        "decodedClaims": e.info.decoded_claims,
-                        "error": e.info.error,
-                        "errorDescription": e.info.error_description,
-                        "traceId": e.info.trace_id,
-                        "correlationId": e.info.correlation_id,
-                    },
-                },
-                "id": req_id,
-            },
-        )
     except Exception as e:
         logger.error(f"MCP handler error: {e}", exc_info=True)
         try:
@@ -425,13 +345,7 @@ def main():
     logger.info(f"Audience: {AUDIENCE}")
     logger.info(f"Required Scopes: {REQUIRED_SCOPES}")
     logger.info(f"Required Roles: {REQUIRED_ROLES}")
-    if HAS_OBO_CREDENTIALS:
-        logger.info("OBO credentials configured for downstream Power BI token exchange.")
-    else:
-        logger.warning(
-            "OBO credentials are not configured. Incoming bearer token will be reused for "
-            "the Power BI API; this can fail when the token audience does not match."
-        )
+    logger.info("Callers authenticate directly against the Power BI API; their token is used as-is.")
     logger.info(f"Listening on http://0.0.0.0:{PORT}")
 
     app = create_app()
